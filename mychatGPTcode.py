@@ -1,128 +1,142 @@
-# Import necessary libraries
+import ipaddress
 
-import numpy as np
 import dgl
-import torch
-import dgl.nn as nn
-# Define a function to preprocess the data
-import numpy as np
-
-
-def preprocess_data(data):
-    """Preprocess the data for training and testing.
-
-    Args:
-        data: A 2D numpy array with the source nodes in the first column,
-            the destination nodes in the second column, the edge weights in the
-            third column, and the dates in the last column.
-
-    Returns:
-        A list with the training data and a list with the testing data.
-    """
-    # Convert the source and destination nodes to integers
-    data[:, 0] = data[:, 0]#.astype(int)
-    data[:, 1] = data[:, 1]#.astype(int)
-
-    # Convert the edge weights to floats
-    data[:, 2] = data[:, 2].astype(float)
-
-    # Sort the data by date
-    data = data[data[:, 3].argsort()]
-
-    # Split the data into training and testing sets
-    train_data, test_data = data[:int(len(data) * 0.8)], data[int(len(data) * 0.8):]
-
-    return list(train_data), list(test_data)
-
-
-def load_data():
-    with open('/data_by_day_simple/datatest.txt', 'r') as f:
-        return [line.strip().split() for line in f]
-# Load the data from a file or database
-data = np.array(load_data())
-
-# Preprocess the data for training and testing
-train_data, test_data = preprocess_data(data)
-# Split the preprocessed data into training and testing sets
-# The training set contains the data from the first 6 days
-# The testing set contains the data from the 7th day
-import dgl
+import dgl.function as fn
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import pandas as pd
+from dgl.nn.pytorch import SAGEConv
 
-# Convert the training data and testing data to lists of tuples
-train_data = [(src, dst, weight) for src, dst, weight, date in train_data]
-test_data = [(src, dst, weight) for src, dst, weight, date in test_data]
-# Create a dictionary to map IP addresses to integer IDs
-ip_to_id = {}
-id_to_ip = {}
-next_id = 0
-for src, dst, weight, date in data:
-    if src not in ip_to_id:
-        ip_to_id[src] = next_id
-        id_to_ip[next_id] = src
-        next_id += 1
-    if dst not in ip_to_id:
-        ip_to_id[dst] = next_id
-        id_to_ip[next_id] = dst
-        next_id += 1
 
-# Convert the IP addresses to integer IDs
-train_data = [(ip_to_id[src], ip_to_id[dst], weight) for src, dst, weight in train_data]
-test_data = [(ip_to_id[src], ip_to_id[dst], weight) for src, dst, weight in test_data]
+def load_data(filename):
+    # Read the data from the text file
+    df = pd.read_csv(filename, sep='	', header=None, names=['source ip', 'destination ip', 'weight', 'date'])
 
-# Create the DGL graph from the training data
-g = dgl.graph(train_data, num_nodes=len(np.unique(data[:, :2])))
+    # Preprocess the data
+    graphs, labels = preprocess_data(df)
 
-# Set the labels for each node in the graph
-g.ndata['label'] = torch.tensor(data[:, 3], dtype=torch.float)
+    return graphs, labels
+
+def preprocess_data(df):
+    # Group the data by date
+    grouped = df.groupby('date')
+
+    # Extract the features and labels for each group
+    graphs = []
+    labels = []
+    for date, group in grouped:
+        # Extract the IP addresses and weights
+
+        group['source ip'] = group['source ip'].apply(lambda x: int(ipaddress.IPv4Address(x)))
+        group['destination ip'] = group['destination ip'].apply(lambda x: int(ipaddress.IPv4Address(x)))
+        src = group['source ip'].values
+        dst = group['destination ip'].values
+        weight = group['weight'].values
+        # Convert the string weights to floats
+        # weights = pd.to_numeric(weight, errors='coerce')
+        #
+        # # Calculate the mean weight
+        # mean_weight = weights.mean()
+        # Replace missing weights with the mean weight
+        mean_weight = 0.13471230717108976
+        weight = [mean_weight if w == 'None' else w for w in weight]
+        lst = [float(x) for x in weight]
+
+        # Create a tensor from the list
+        weight = torch.tensor(lst).float()
+        # Convert the weights to a float tensor
+        # weight = torch.tensor(weight).float()
+        unique_nodes = set(src) | set(dst)
+        # label = len(unique_nodes)
+        # Create a graph for this group
+        g = dgl.DGLGraph()
+        g.add_nodes(len(unique_nodes))
+        g.add_edges(src, dst)
+        g.edata['weight'] = weight
+
+        # Extract the label for this group
+        # unique_nodes = set(src) | set(dst)
+        label = len(unique_nodes)
+
+        graphs.append(g)
+        labels.append(label)
+
+    return graphs, labels
 
 # Define the GraphSAGE model
 class GraphSAGE(nn.Module):
-    def __init__(self, in_feats, hidden_size, num_classes):
+    def __init__(self, in_feats, hidden_size, out_feats):
         super(GraphSAGE, self).__init__()
         self.layers = nn.ModuleList([
-            nn.Linear(in_feats, hidden_size),
-            nn.ReLU()
+            SAGEConv(in_feats, hidden_size, 'mean'),
+            SAGEConv(hidden_size, hidden_size, 'mean'),
+            SAGEConv(hidden_size, out_feats, 'mean')
         ])
-        self.classify = nn.Linear(hidden_size, num_classes)
 
     def forward(self, g, inputs):
+        h = inputs
         for layer in self.layers:
-            inputs = layer(inputs)
-        return self.classify(inputs)
+            h = layer(g, h)
+        return h
 
-# Initialize the GraphSAGE model
-model = GraphSAGE(in_feats=1, hidden_size=64, num_classes=1)
-
-# Set the model to the device
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
-
-# Define the loss function and optimizer
-loss_fn = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-# Training loop
-for epoch in range(10):
-    # Forward pass
-    predictions = model(g, g.ndata['label'])
-    loss = loss_fn(predictions, g.ndata['label'])
-
-    # Backward pass
+# Define the training and evaluation functions
+def train(model, g, inputs, labels):
+    # Set the model to training mode
+    model.train()
+    # Use the model to make predictions
+    logits = model(g, inputs)
+    # Calculate the loss
+    loss = F.cross_entropy(logits, labels)
+    # Clear the gradients
     optimizer.zero_grad()
+    # Backpropagate the loss
     loss.backward()
+    # Update the model parameters
     optimizer.step()
 
-    # Print the loss
-    print('Epoch {}: Loss = {}'.format(epoch, loss.item()))
+    return loss
 
-# Test the model on the testing data
-test_g = dgl.graph(test_data, num_nodes=len(np.unique(data[:, :2])))
-test_g.ndata['label'] = torch.tensor(data[:, 3], dtype=torch.float)
-test_predictions = model(test_g, test_g.ndata['label'])
-test_loss = loss_fn(test_predictions, test_g.ndata['label'])
-print('Test Loss = {}'.format(test_loss.item()))
+def evaluate(model, g, inputs, labels):
+    # Set the model to evaluation mode
+    model.eval()
+    # Use the model to make predictions
+    logits = model(g, inputs)
+    # Calculate the MAPE
+    mape = ((logits - labels).abs() / labels).mean()
+    return mape
 
-#
+
+# Load the data
+graphs, labels = load_data('/Users/tedlau/PostGraduatePeriod/Graduate/Tasks/Task9-神经网络比较-不会--但又给续上了/data_by_day_simple/datatest.txt')
+
+# Create the model
+model = GraphSAGE(in_feats=1, hidden_size=16, out_feats=2)
+
+# Use Adam as the optimizer
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+# Set the number of epochs
+num_epochs = 10
+
+# Set the device to use for training
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Move the model and data to the device
+model = model.to(device)
+# graphs = graphs.to(device)
+# labels = labels.to(device)
+
+# Loop over the epochs
+for epoch in range(num_epochs):
+    # Loop over the graphs and labels
+    for g, label in zip(graphs, labels):
+        # Extract the node features
+        inputs = g.edata['weight']
+        # Reshape the node features to (batch size, feature size)
+        inputs = inputs.view(-1, 1)
+        # Train the model on this graph
+        loss = train(model, g, inputs, label)
+        # Calculate the accuracy on the training set
+        accuracy = evaluate(model, graphs, inputs, labels)
+        print(f'Epoch {epoch+1}: loss={loss:.4f}, accuracy={accuracy:.4f}')
+
