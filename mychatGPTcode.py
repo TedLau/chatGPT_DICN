@@ -1,142 +1,115 @@
-import ipaddress
-
 import dgl
 import dgl.function as fn
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import pandas as pd
-from dgl.nn.pytorch import SAGEConv
+import torch.nn.functional as F
 
 
-def load_data(filename):
-    # Read the data from the text file
-    df = pd.read_csv(filename, sep='	', header=None, names=['source ip', 'destination ip', 'weight', 'date'])
+def load_data(file_path, window_size):
+    df = pd.read_csv(file_path, sep=' ', names=['src', 'dst', 'weight', 'timestamp'])
+    df, node_dict = preprocess_data(df)
+    graphs = []
+    for i in tqdm(range(len(df) - window_size)):
+        g = dgl.DGLGraph()
+        g.add_nodes(len(node_dict))
+        src = df.iloc[i:i+window_size]['src'].values
+        dst = df.iloc[i:i+window_size]['dst'].values
+        weight = df.iloc[i:i+window_size]['weight'].values
+        g.add_edges(src, dst, {'weight': weight})
+        graphs.append(g)
+    labels = df.iloc[window_size:]['timestamp'].apply(lambda x: len(df[df['timestamp'] == x]['src'].unique())).values
+    return graphs, labels, node_dict
 
-    # Preprocess the data
-    graphs, labels = preprocess_data(df)
-
-    return graphs, labels
 
 def preprocess_data(df):
-    # Group the data by date
-    grouped = df.groupby('date')
+    df['src'] = df['src'].astype(str)
+    df['dst'] = df['dst'].astype(str)
+    df['timestamp'] = df['timestamp'].astype(str)
+    unique_nodes = set(df['src'].unique()).union(df['dst'].unique())
+    node_dict = {node: i for i, node in enumerate(unique_nodes)}
+    df['src'] = df['src'].map(node_dict)
+    df['dst'] = df['dst'].map(node_dict)
+    df['weight'] = df['weight'].replace('None', np.nan)
+    df['weight'] = df['weight'].astype(float)
+    mean_weight = df['weight'].mean()
+    df['weight'] = df['weight'].fillna(mean_weight)
+    return df, node_dict
 
-    # Extract the features and labels for each group
-    graphs = []
-    labels = []
-    for date, group in grouped:
-        # Extract the IP addresses and weights
 
-        group['source ip'] = group['source ip'].apply(lambda x: int(ipaddress.IPv4Address(x)))
-        group['destination ip'] = group['destination ip'].apply(lambda x: int(ipaddress.IPv4Address(x)))
-        src = group['source ip'].values
-        dst = group['destination ip'].values
-        weight = group['weight'].values
-        # Convert the string weights to floats
-        # weights = pd.to_numeric(weight, errors='coerce')
-        #
-        # # Calculate the mean weight
-        # mean_weight = weights.mean()
-        # Replace missing weights with the mean weight
-        mean_weight = 0.13471230717108976
-        weight = [mean_weight if w == 'None' else w for w in weight]
-        lst = [float(x) for x in weight]
+class SAGENet(nn.Module):
+    def __init__(self, in_size, hidden_size, out_size):
+        super(SAGENet, self).__init__()
+        self.conv1 = dgl.nn.SAGEConv(in_size, hidden_size, aggregator_type='mean')
+        self.conv2 = dgl.nn.SAGEConv(hidden_size, hidden_size, aggregator_type='mean')
+        self.conv3 = dgl.nn.SAGEConv(hidden_size, out_size, aggregator_type='mean')
 
-        # Create a tensor from the list
-        weight = torch.tensor(lst).float()
-        # Convert the weights to a float tensor
-        # weight = torch.tensor(weight).float()
-        unique_nodes = set(src) | set(dst)
-        # label = len(unique_nodes)
-        # Create a graph for this group
-        g = dgl.DGLGraph()
-        g.add_nodes(len(unique_nodes))
-        g.add_edges(src, dst)
-        g.edata['weight'] = weight
-
-        # Extract the label for this group
-        # unique_nodes = set(src) | set(dst)
-        label = len(unique_nodes)
-
-        graphs.append(g)
-        labels.append(label)
-
-    return graphs, labels
-
-# Define the GraphSAGE model
-class GraphSAGE(nn.Module):
-    def __init__(self, in_feats, hidden_size, out_feats):
-        super(GraphSAGE, self).__init__()
-        self.layers = nn.ModuleList([
-            SAGEConv(in_feats, hidden_size, 'mean'),
-            SAGEConv(hidden_size, hidden_size, 'mean'),
-            SAGEConv(hidden_size, out_feats, 'mean')
-        ])
-
-    def forward(self, g, inputs):
-        h = inputs
-        for layer in self.layers:
-            h = layer(g, h)
+    def forward(self, g):
+        h = g.ndata['weight']
+        h = F.relu(self.conv1(g, h))
+        h = F.relu(self.conv2(g, h))
+        h = self.conv3(g, h)
         return h
 
-# Define the training and evaluation functions
-def train(model, g, inputs, labels):
-    # Set the model to training mode
+
+def train(model, data_iter, loss_fn, optimizer, device):
     model.train()
-    # Use the model to make predictions
-    logits = model(g, inputs)
-    # Calculate the loss
-    loss = F.cross_entropy(logits, labels)
-    # Clear the gradients
-    optimizer.zero_grad()
-    # Backpropagate the loss
-    loss.backward()
-    # Update the model parameters
-    optimizer.step()
+    total_loss = 0
+    total_mape = 0
+    for i, (graph, label) in enumerate(data_iter):
+        optimizer.zero_grad()
+        graph = graph.to(device)
+        label = label.to(device)
+        logits = model(graph)
+        loss = loss_fn(logits, label)
+        total_loss += loss.item()
+        mape = torch.mean(torch.abs((label - logits) / label))
+        total_mape += mape.item()
+        loss.backward()
+        optimizer.step()
+    return total_loss / (i + 1), total_mape / (i + 1)
 
-    return loss
 
-def evaluate(model, g, inputs, labels):
-    # Set the model to evaluation mode
+def evaluate(model, graphs, labels):
     model.eval()
-    # Use the model to make predictions
-    logits = model(g, inputs)
-    # Calculate the MAPE
-    mape = ((logits - labels).abs() / labels).mean()
-    return mape
+    with torch.no_grad():
+        logits = model(graphs)
+        logits = logits.squeeze()
+        labels = labels.float()
+        loss = F.mse_loss(logits, labels)
+        mape = torch.mean(torch.abs((labels - logits) / labels))
+    return loss, mape
 
+
+# Set the hyperparameters
+num_epochs = 100
+learning_rate = 0.01
+hidden_size = 32
+
+# Set the device
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+# Set random seeds for reproducibility
+torch.manual_seed(0)
+np.random.seed(0)
 
 # Load the data
 graphs, labels = load_data('/Users/tedlau/PostGraduatePeriod/Graduate/Tasks/Task9-神经网络比较-不会--但又给续上了/data_by_day_simple/datatest.txt')
 
+# Preprocess the data
+graphs, labels = preprocess_data(graphs, labels)
+
 # Create the model
-model = GraphSAGE(in_feats=1, hidden_size=16, out_feats=2)
+model = SAGENet(1, hidden_size, 1).to(device)
 
-# Use Adam as the optimizer
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+# Define the optimizer and criterion
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-# Set the number of epochs
-num_epochs = 10
-
-# Set the device to use for training
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# Move the model and data to the device
-model = model.to(device)
-# graphs = graphs.to(device)
-# labels = labels.to(device)
-
-# Loop over the epochs
+# Training loop
 for epoch in range(num_epochs):
-    # Loop over the graphs and labels
-    for g, label in zip(graphs, labels):
-        # Extract the node features
-        inputs = g.edata['weight']
-        # Reshape the node features to (batch size, feature size)
-        inputs = inputs.view(-1, 1)
-        # Train the model on this graph
-        loss = train(model, g, inputs, label)
-        # Calculate the accuracy on the training set
-        accuracy = evaluate(model, graphs, inputs, labels)
-        print(f'Epoch {epoch+1}: loss={loss:.4f}, accuracy={accuracy:.4f}')
+    train_loss, train_mape = train(model, optimizer, graphs, labels)
+    val_loss, val_mape = evaluate(model, graphs, labels)
 
+    print(
+        f'Epoch {epoch + 1}: train loss = {train_loss:.4f}, train MAPE = {train_mape:.4f}, val loss = {val_loss:.4f}, val MAPE = {val_mape:.4f}')
