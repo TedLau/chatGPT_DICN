@@ -5,10 +5,11 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 
 def load_data(file_path, window_size):
-    df = pd.read_csv(file_path, sep=' ', names=['src', 'dst', 'weight', 'timestamp'])
+    df = pd.read_csv(file_path, sep='	', names=['src', 'dst', 'weight', 'timestamp'])
     df, node_dict = preprocess_data(df)
     graphs = []
     for i in tqdm(range(len(df) - window_size)):
@@ -20,7 +21,7 @@ def load_data(file_path, window_size):
         g.add_edges(src, dst, {'weight': weight})
         graphs.append(g)
     labels = df.iloc[window_size:]['timestamp'].apply(lambda x: len(df[df['timestamp'] == x]['src'].unique())).values
-    return graphs, labels, node_dict
+    return graphs, labels#, node_dict
 
 
 def preprocess_data(df):
@@ -95,7 +96,7 @@ torch.manual_seed(0)
 np.random.seed(0)
 
 # Load the data
-graphs, labels = load_data('/Users/tedlau/PostGraduatePeriod/Graduate/Tasks/Task9-神经网络比较-不会--但又给续上了/data_by_day_simple/datatest.txt')
+graphs, labels = load_data('/Users/tedlau/PostGraduatePeriod/Graduate/Tasks/Task9-神经网络比较-不会--但又给续上了/data_by_day_simple/datatest.txt',6)
 
 # Preprocess the data
 graphs, labels = preprocess_data(graphs, labels)
