@@ -3,176 +3,224 @@ import dgl
 import numpy as np
 import pandas as pd
 import torch.nn as nn
-import torch.nn.functional as F
+from tqdm import tqdm
 import torch.nn.functional as F
 
+# Set the device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+
+# def mape_loss(y_pred, y_true):
+#     y_true, y_pred = torch.Tensor(y_true).detach(), torch.Tensor(y_pred).detach()
+#
+#     return torch.mean(torch.abs((y_true - y_pred) / y_true))
+def mape_loss(y_pred, y_true):
+    y_pred = y_pred.float()
+    y_true = y_true
+    return torch.mean(torch.abs((y_true - y_pred) / y_true))
+
+    # Define the DeepWalk model
+
+
+class DeepWalk(nn.Module):
+    def __init__(self, num_nodes, embedding_dim, window_size):
+        super(DeepWalk, self).__init__()
+        self.embedding_dim = embedding_dim
+        self.window_size = window_size
+        self.num_nodes = num_nodes
+        self.node_embeddings = nn.Embedding(num_nodes, embedding_dim)
+        self.linear1 = nn.Linear(embedding_dim, 128)
+        self.linear2 = nn.Linear(128, 64)
+        self.linear3 = nn.Linear(64, 1)
+
+    def forward(self, node_sequence):
+        node_embeddings = self.node_embeddings(node_sequence)
+        node_embeddings = node_embeddings.mean(dim=1)
+        out = self.linear1(node_embeddings)
+        out = F.relu(out)
+        out = self.linear2(out)
+        out = F.relu(out)
+        out = self.linear3(out)
+        return out
+
+
+# Define the mean absolute percentage error (MAPE) loss function
+
+ip_to_id = {}
+def random_walk(graph, start_node, walk_length):
+    """
+    Generates a random walk on the given graph starting from the given node.
+
+    Parameters:
+        graph (dgl.DGLGraph): The graph to perform the random walk on.
+        start_node (int): The node to start the random walk from.
+        walk_length (int): The length of the random walk.
+
+    Returns:
+        list: A list of nodes representing the random walk.
+    """
+    walk = [start_node]
+    current_node = start_node
+    for _ in range(walk_length):
+        # Get the neighbors of the current node
+        neighbors = graph.successors(current_node)
+        # Choose a random neighbor
+        next_node = np.random.choice(neighbors)
+        walk.append(next_node)
+        current_node = next_node
+    return walk
+
+
+# Define the preprocessing function
 def preprocess_data(df, window_size):
-    # Sort the dataframe by date
     df = df.sort_values(by='date')
 
-    # Create a dictionary to map each node to a unique id
-    node_to_id = {}
-    id_to_node = {}
-    idx = 0
-    for nodes in df[['src', 'dst']].values:
-        for node in nodes:
-            if node not in node_to_id:
-                node_to_id[node] = idx
-                id_to_node[idx] = node
-                idx += 1
-
-    # Convert the src and dst nodes to ids
-    df['src'] = df['src'].apply(lambda x: node_to_id[x])
-    df['dst'] = df['dst'].apply(lambda x: node_to_id[x])
-
-    # Group the data by date
-    groups = df.groupby('date')
-    df['weight'] = df['weight'].replace('None', np.nan)
-    df['weight'] = df['weight'].astype(float)
-    mean_weight = df['weight'].mean()
-    df['weight'] = df['weight'].fillna(mean_weight)
     # Create a list of graphs, one for each day
-    labels = []
     graphs = []
-    for _, group in groups:
+    labels = []
+    previous_node_numbers = []
+    for _, group in df.groupby('date'):
+        ip_to_id = {}
+        id_to_ip = {}
+        idx = 0
+        for ips in group[['src', 'dst']].values:
+            for ip in ips:
+                if ip not in ip_to_id:
+                    ip_to_id[ip] = idx
+                    id_to_ip[idx] = ip
+                    idx += 1
+
+        # Convert the src and dst IP addresses to integers using the mapping
+        group['src'] = group['src'].apply(lambda x: ip_to_id[x])
+        group['dst'] = group['dst'].apply(lambda x: ip_to_id[x])
         # Create a graph for the current day
         g = dgl.DGLGraph()
-
-        g.add_nodes(len(set(group.src) | set(group.dst)))
-        labels.append(len(set(group.src) | set(group.dst)))
+        # Add the maximum number of nodes to the graph
+        g.add_nodes(idx)
         for _, row in group.iterrows():
-            src, dst, weight = row['src'].astype(int), row['dst'].astype(int), row['weight']
+            src, dst = row['src'], row['dst']
+            # Add the source and destination nodes to the graph if they are not already present
+            if src >= g.number_of_nodes():
+                g.add_nodes(src - g.number_of_nodes() + 1)
+            if dst >= g.number_of_nodes():
+                g.add_nodes(dst - g.number_of_nodes() + 1)
             # Add an edge to the graph
-            # length = len(set(s))
-            g.add_edge(src, dst)  # , weight=weight
-        graphs.append(g)
+            g.add_edge(src, dst)
 
-    # Compute the labels for each window
-    #
-    # # for i in range(window_size, len(graphs)):
-    # #     labels.append(len(np.unique(graphs[i].ndata['id'])))
-    # for i in range(len(graphs)):
-    #     labels.append(i.num_nodes)
+        node_sequence = torch.tensor(list(range(g.number_of_nodes())), dtype=torch.long)
+        g.ndata['node_sequence'] = node_sequence
+        previous_node_numbers.append(node_sequence)
+        previous_node_numbers = list(reversed(previous_node_numbers))
+        node_sequence = torch.cat(previous_node_numbers, dim=0)
+        graphs.append(node_sequence)
+        labels.append(g.number_of_nodes())
+        # Move to the next day
 
+    # Return the list of graphs and labels
     return graphs, labels
 
 
-def train(graphs, labels, model, optimizer, criterion, device):
-    model.train()
+# Load the data
+df = pd.read_csv(
+    '/Users/tedlau/PostGraduatePeriod/Graduate/Tasks/Task9-神经网络比较-不会--但又给续上了/data_by_day_simple/datatest.txt',
+    sep='	', header=None, names=['src', 'dst', 'weight', 'date'])
+# Load the data
+
+window_size = 7
+# Preprocess the data
+graphs, labels = preprocess_data(df, window_size=7)
+
+# Initialize the DeepWalk model
+model = DeepWalk(num_nodes=df['src'].nunique(), embedding_dim=64, window_size=7).to(device)
+
+# Set the optimizer and criterion
+optimizer = torch.optim.Adam(model.parameters())
+criterion = mape_loss
+
+# Set the number of epochs and the learning rate
+num_epochs = 100
+learning_rate = 0.001
+# Train the model
+# model = DeepWalk(num_nodes=num_nodes, embedding_dim=16, window_size=window_size).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+for epoch in range(200):
     total_loss = 0
-    for g, label in zip(graphs, labels):
-        # Convert the graph to a tensor and send it to the device
-        g = g.to(device)
-        # Generate node embeddings for the graph
-        node_embeddings = model(g)
-        # Compute the prediction
-        prediction = node_embeddings.sum()
+    for i, (graph, label) in enumerate(zip(graphs, labels)):
+        # Get the node sequences for the current graph
+        node_sequences = []
+        for j in range(window_size):
+            if i - j < 0:
+                break
+            node_sequences.append(graphs[i - j])#.ndata['node_sequence']
+        # Reverse the list of node sequences so that the most recent graph is first
+        node_sequences = list(reversed(node_sequences))
+        node_sequences[0] = node_sequences[0][0:64]
+        for i in range(len(node_sequences)):
+            node_sequences[i] = node_sequences[i][i*64:i*64+64]
+        # Concatenate the node sequences into a single tensor
+        node_sequence = torch.cat(node_sequences, dim=0)
+        # Make the prediction
+        prediction = model(node_sequence)
         # Compute the loss
-        loss = criterion(prediction, label)
-        # Backpropagate the error and update the model parameters
+        loss = mape_loss(prediction, label)
+        total_loss += loss.item()
+        # Zero the gradients
         optimizer.zero_grad()
-        loss.backward()
+        # Backpropagate the loss
+        # loss.backward()
+        # Update the model weights
         optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(graphs)
+    if epoch % 20 == 0:
+        print(f'Epoch {epoch}, loss {total_loss / len(labels)}')
+
+#
 
 
-def evaluate(graphs, labels, model, criterion, device):
-    model.eval()
-    total_loss = 0
-    for g, label in zip(graphs, labels):
-        # Convert the graph to a tensor and send it to the device
-        g = g.to(device)
-        # Generate node embeddings for the graph
-        node_embeddings = model(g)
-        # Compute the prediction
-        prediction = node_embeddings.sum()
-        # Compute the loss
-        loss = criterion(prediction, label)
-        total_loss += loss.item()
-    return total_loss / len(graphs)
-
-
-def mean_absolute_percentage_error(y_true, y_pred):
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
-    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
-
-
-class NeuralNet(nn.Module):
-    def __init__(self, num_nodes, hidden_size, num_classes):
-        super(NeuralNet, self).__init__()
-        self.fc1 = nn.Linear(num_nodes, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, num_classes)
-
-    def forward(self, graph):
-        node_embeddings = self.deepwalk(graph)
-        x = self.fc1(node_embeddings)
-        x = F.relu(x)
-        x = self.fc2(x)
-        return x
-
-    def deepwalk(self, graph):
-        # Perform the DeepWalk algorithm on the graph to generate node embeddings
-        # ...
-        return node_embeddings
-
-
-def main():
-    # Load the data
-    df = pd.read_csv(
-        '/Users/tedlau/PostGraduatePeriod/Graduate/Tasks/Task9-神经网络比较-不会--但又给续上了/data_by_day_simple/datatest.txt',
-        sep='	', header=None, names=['src', 'dst', 'weight', 'date'])
-
-    # Set the hyperparameters
-    window_size = 6
-    hidden_size = 64
-    num_layers = 1
-    lr = 0.001
-    weight_decay = 0.0005
-    epochs = 100
-
-    # Preprocess the data
-    graphs, labels = preprocess_data(df, window_size)
-    num_nodes = len(set(df.src) | set(df.dst))
-    num_classes = 1
-
-    # Split the data into training and test sets
-    train_graphs = graphs[:-window_size]
-    train_labels = labels[:-window_size]
-    test_graphs = graphs[-window_size:]
-    test_labels = labels[-window_size:]
-
-    # Set the device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Initialize the model and optimizer
-    model = NeuralNet(num_nodes, hidden_size, num_classes).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = nn.MSELoss()
-
-    # Train the model
-    for epoch in range(epochs):
-        train_loss = train(train_graphs, train_labels, model, optimizer, criterion, device)
-        test_loss = evaluate(test_graphs, test_labels, model, criterion, device)
-        print(f'Epoch {epoch + 1}: train loss = {train_loss:.4f}, test loss = {test_loss:.4f}')
-
-    # Make predictions on the test set
-    predictions = []
-    for g in test_graphs:
-        # Convert the graph to a tensor and send it to the device
-        g = g.to(device)
-        # Generate node embeddings for the graph
-        node_embeddings = model(g)
-        # Compute the prediction
-        prediction = node_embeddings.sum()
-        predictions.append(prediction.item())
-
-    # Compute the MAPE
-    mape = mean_absolute_percentage_error(test_labels, predictions)
-    print(f'MAPE = {mape:.2f}%')
-
-
-if __name__ == '__main__':
-    main()
+# # Preprocess the data
+# node_lists, labels = preprocess_data(df, window_size=1)
+#
+# # Convert the labels to a tensor
+# labels = torch.tensor(labels).to(device)
+#
+# # Create the model
+# model = DeepWalk(num_nodes=len(ip_to_id)).to(device)
+#
+# # Define the optimizer and criterion
+# optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+# criterion = nn.MSELoss()
+#
+# # Training loop
+# for epoch in range(5):
+#     total_loss = 0
+#     for node_list, label in zip(node_lists, labels):
+#         # Convert the node list to a tensor
+#         node_list = torch.tensor(node_list).to(device)
+#         # Forward pass
+#         output = model(None, node_list)
+#         output = output.view(1, -1)
+#
+#         output = output.float()
+#         # Compute the loss
+#         loss = mape_loss(output, labels)
+#
+#         total_loss += loss.item()
+#         # Zero the gradients
+#         optimizer.zero_grad()
+#         # Backward pass
+#         loss.backward()
+#         # Update the parameters
+#         optimizer.step()
+#     print(f'Epoch {epoch + 1}: Loss = {total_loss / len(node_lists)}')
+#
+# # Evaluation loop
+# total_mape = 0
+# for node_list, label in zip(node_lists, labels):
+#     # Convert the node list to a tensor
+#     node_list = torch.tensor(node_list).to(device)
+#     # Forward pass
+#     output = model(None, node_list)
+#     # Compute the mean absolute percentage error
+#     mape = mape_loss(output.item(), label.item())
+#     total_mape += mape
+# print(f'Mean absolute percentage error: {total_mape / len(node_lists)}')

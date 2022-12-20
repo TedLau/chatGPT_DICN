@@ -37,9 +37,12 @@ class GraphSAGE(nn.Module):
         h = features
 
         for i, layer in enumerate(self.layers):
+            # Make sure the input tensor is contiguous
             h = h.contiguous()
+            # Apply the layer
             h = layer(graph, h)
             h = h.contiguous()
+            # Apply ReLU activation for hidden layers, except for the last layer
             if i != len(self.layers) - 1:
                 h = F.relu(h)
         return h
@@ -55,30 +58,28 @@ def mape_loss(y_pred, y_true):
 def preprocess_data(df, window_size):
     df = df.sort_values(by='date')
 
-    # Create a dictionary to map each IP address to a unique integer
-    # map nodes to ids for all dates
-    ip_to_id = {}
-    id_to_ip = {}
-    idx = 0
-    for ips in df[['src', 'dst']].values:
-        for ip in ips:
-            if ip not in ip_to_id:
-                ip_to_id[ip] = idx
-                id_to_ip[idx] = ip
-                idx += 1
-
-    # Convert the src and dst IP addresses to integers using the mapping
-    df['src'] = df['src'].apply(lambda x: ip_to_id[x])
-    df['dst'] = df['dst'].apply(lambda x: ip_to_id[x])
 
     # Create a list of graphs, one for each day
     graphs = []
     labels = []
     for _, group in df.groupby('date'):
+        ip_to_id = {}
+        id_to_ip = {}
+        idx = 0
+        for ips in group[['src', 'dst']].values:
+            for ip in ips:
+                if ip not in ip_to_id:
+                    ip_to_id[ip] = idx
+                    id_to_ip[idx] = ip
+                    idx += 1
+
+        # Convert the src and dst IP addresses to integers using the mapping
+        group['src'] = group['src'].apply(lambda x: ip_to_id[x])
+        group['dst'] = group['dst'].apply(lambda x: ip_to_id[x])
         # Create a graph for the current day
         g = dgl.DGLGraph()
         # Add the maximum number of nodes to the graph
-        g.add_nodes(max(group['src'].max(), group['dst'].max()) + 1)
+        g.add_nodes(idx)
         for _, row in group.iterrows():
             src, dst = row['src'], row['dst']
             # Add the source and destination nodes to the graph if they are not already present
@@ -89,7 +90,7 @@ def preprocess_data(df, window_size):
             # Add an edge to the graph
             g.add_edge(src, dst)
         graphs.append(g)
-        labels.append(len(group))
+        labels.append(idx)
 
     return graphs, labels
 
@@ -124,6 +125,10 @@ def train(graphs, labels, window_size, hidden_size, num_layers, aggregator_type,
         for i in range(len(train_graphs) - window_size):
             window_graphs = train_graphs[i:i+window_size]
             window_label = train_labels[i+window_size]
+            window_graphs = [g.contiguous() for g in window_graphs]
+            # Concatenate the graphs in the current window into a single graph
+            g = dgl.batch(window_graphs)
+
             # Concatenate the graphs in the current window into a single graph
             g = dgl.batch(window_graphs)
             # Compute the output of the model on the concatenated graph
@@ -148,8 +153,8 @@ df = pd.read_csv(
     sep='	', header=None, names=['src', 'dst', 'weight', 'date'])
 
 # Preprocess the data
-graphs, labels = preprocess_data(df, window_size=6)
+graphs, labels = preprocess_data(df, window_size=5)
 
 # Train the model
-train(graphs, labels, window_size=6, hidden_size=64, num_layers=2, aggregator_type='mean', lr=0.01,
+train(graphs, labels, window_size=5, hidden_size=64, num_layers=2, aggregator_type='mean', lr=0.01,
       weight_decay=0.001, epochs=10)
