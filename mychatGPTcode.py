@@ -55,39 +55,41 @@ def mape_loss(y_pred, y_true):
 def preprocess_data(df, window_size):
     df = df.sort_values(by='date')
 
-    # Create a dictionary to map each node to a unique id
-    node_to_id = {}
-    id_to_node = {}
+    # Create a dictionary to map each IP address to a unique integer
+    # map nodes to ids for all dates
+    ip_to_id = {}
+    id_to_ip = {}
     idx = 0
-    for nodes in df[['src', 'dst']].values:
-        for node in nodes:
-            if node not in node_to_id:
-                node_to_id[node] = idx
-                id_to_node[idx] = node
+    for ips in df[['src', 'dst']].values:
+        for ip in ips:
+            if ip not in ip_to_id:
+                ip_to_id[ip] = idx
+                id_to_ip[idx] = ip
                 idx += 1
 
-    # Convert the src and dst nodes to ids
-    df['src'] = df['src'].apply(lambda x: node_to_id[x])
-    df['dst'] = df['dst'].apply(lambda x: node_to_id[x])
+    # Convert the src and dst IP addresses to integers using the mapping
+    df['src'] = df['src'].apply(lambda x: ip_to_id[x])
+    df['dst'] = df['dst'].apply(lambda x: ip_to_id[x])
 
-    # Group the data by date
-    groups = df.groupby('date')
     # Create a list of graphs, one for each day
     graphs = []
-    for _, group in groups:
+    labels = []
+    for _, group in df.groupby('date'):
         # Create a graph for the current day
         g = dgl.DGLGraph()
-        g.add_nodes(len(group))
+        # Add the maximum number of nodes to the graph
+        g.add_nodes(max(group['src'].max(), group['dst'].max()) + 1)
         for _, row in group.iterrows():
             src, dst = row['src'], row['dst']
+            # Add the source and destination nodes to the graph if they are not already present
+            if src >= g.number_of_nodes():
+                g.add_nodes(src - g.number_of_nodes() + 1)
+            if dst >= g.number_of_nodes():
+                g.add_nodes(dst - g.number_of_nodes() + 1)
             # Add an edge to the graph
             g.add_edge(src, dst)
         graphs.append(g)
-
-    # Compute the labels for each window
-    labels = []
-    for i in range(window_size, len(graphs)):
-        labels.append(graphs[i].number_of_nodes())
+        labels.append(len(group))
 
     return graphs, labels
 
@@ -99,28 +101,45 @@ def train(graphs, labels, window_size, hidden_size, num_layers, aggregator_type,
     model = GraphSAGE(hidden_size, hidden_size, num_classes=1, num_layers=num_layers,
                       aggregator_type=aggregator_type)
     model = model.to(device)
+    # Define the optimizer and loss function
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = nn.MSELoss()
+
+    # Create pandas dataframes to store the training and validation loss and MAPE for each epoch
+    train_loss = pd.DataFrame(columns=['loss', 'mape'])
+    val_loss = pd.DataFrame(columns=['loss', 'mape'])
+
+    # Split the data into training and validation sets
+    num_train = int(len(graphs) * 0.8)
+    train_graphs = graphs[:num_train]
+    train_labels = labels[:num_train]
+    val_graphs = graphs[num_train:]
+    val_labels = labels[num_train:]
 
     # Train the model
     for epoch in range(epochs):
         model.train()
         total_loss = 0
-        for i in range(len(graphs) - window_size):
-            # Create a subgraph for the current window
-            subgraph = dgl.batch(graphs[i:i + window_size])
-            # Compute the node features for the subgraph
-            node_features = None
-            # Compute the logits for the subgraph
-            logits = model(subgraph, None)
-
-            # Compute the loss for the current window
-            loss = mape_loss(logits, labels[i])
+        # Loop over the training data in windows
+        for i in range(len(train_graphs) - window_size):
+            window_graphs = train_graphs[i:i+window_size]
+            window_label = train_labels[i+window_size]
+            # Concatenate the graphs in the current window into a single graph
+            g = dgl.batch(window_graphs)
+            # Compute the output of the model on the concatenated graph
+            output = model(g)
+            # Compute the loss
+            loss = loss_fn(output, torch.Tensor([window_label]).to(device))
             total_loss += loss.item()
-            # Backpropagate the error
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-        print(f'Epoch {epoch + 1}: loss = {total_loss / len(graphs)}')
+
+            # Compute the average loss and MAPE for the epoch
+        avg_loss = total_loss / (len(val_graphs) - window_size)
+        avg_mape = mape_loss(output.cpu().detach().numpy(), window_label)
+        # Add the loss and MAPE for the epoch to the validation dataframe
+        val_loss = val_loss.append({'loss': avg_loss, 'mape': avg_mape}, ignore_index=True)
+
+    # Return the model and the training and validation dataframes
+    return model, train_loss, val_loss
 
 
 # Load the data
