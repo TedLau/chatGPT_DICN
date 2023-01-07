@@ -4,7 +4,8 @@ import dgl.function as fn
 import numpy as np
 import pandas as pd
 import torch.nn as nn
-import torch.nn.functional as F
+
+
 from dgl.nn.pytorch import SAGEConv
 from tqdm import tqdm
 
@@ -20,6 +21,7 @@ class GraphSAGE(nn.Module):
                  num_classes,
                  num_layers,
                  aggregator_type):
+        in_feats = 0
         super(GraphSAGE, self).__init__()
         self.layers = nn.ModuleList()
         # input layer
@@ -31,16 +33,18 @@ class GraphSAGE(nn.Module):
         self.layers.append(SAGEConv(hidden_size, num_classes, aggregator_type))
 
     def forward(self, graph, features=None):
-        # If no node features are provided, use an empty tensor as the node features
+        # If no node features are provided, use a tensor of ones as the node features
         if features is None:
-            features = torch.empty((graph.number_of_nodes(), 0)).to(device)
-        h = features
+            features = torch.ones((graph.number_of_nodes(), 1)).to(device)
+
+        h = torch.full((graph.number_of_nodes(), 1), 0.5).to(device)
+
 
         for i, layer in enumerate(self.layers):
             # Make sure the input tensor is contiguous
             h = h.contiguous()
             # Apply the layer
-            h = layer(graph, h)
+            h = layer(graph, h.contiguous())
             h = h.contiguous()
             # Apply ReLU activation for hidden layers, except for the last layer
             if i != len(self.layers) - 1:
@@ -125,12 +129,22 @@ def train(graphs, labels, window_size, hidden_size, num_layers, aggregator_type,
         for i in range(len(train_graphs) - window_size):
             window_graphs = train_graphs[i:i+window_size]
             window_label = train_labels[i+window_size]
-            window_graphs = [g.contiguous() for g in window_graphs]
-            # Concatenate the graphs in the current window into a single graph
-            g = dgl.batch(window_graphs)
+            # window_graphs = [g.contiguous() for g in window_graphs]
+            # # Concatenate the graphs in the current window into a single graph
+            # Initialize an empty graph
+            # Initialize a new graph
+            max_nodes = max(graph.number_of_nodes() for graph in window_graphs)
+            for graph in window_graphs:
+                graph.add_nodes(max_nodes - graph.number_of_nodes())
 
-            # Concatenate the graphs in the current window into a single graph
+            # Concatenate the graphs using the dgl.batch function
             g = dgl.batch(window_graphs)
+            # edges = []
+            # for g in window_graphs:
+            #     for u, v in g.edges()[0],g.edges()[1]:
+            #         edges.append((u, v))
+            # # Concatenate the graphs in the current window into a single graph
+            # g = dgl.hetero_from_relations(edges)
             # Compute the output of the model on the concatenated graph
             output = model(g)
             # Compute the loss
